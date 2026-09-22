@@ -1,7 +1,10 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 import { useLiveState } from "@/lib/useLiveState";
+import { DEFAULT_FULL_COLOR_COUNT } from "@/lib/village";
 import { HeartbeatCounter } from "@/components/HeartbeatCounter";
 import { HeartbeatPanel } from "@/components/HeartbeatPanel";
 import { ClosingScreen } from "@/components/ClosingScreen";
@@ -12,12 +15,21 @@ const VoxelVillage = dynamic(
   { ssr: false }
 );
 
-export default function VillagePage() {
+function VillageInner() {
   const { count, mode, connected } = useLiveState();
+  const params = useSearchParams();
+  // ?full=N — how many heartbeats paint the whole island (handy for demos)
+  const fullParam = Number(params.get("full"));
+  const fullColorCount = Number.isFinite(fullParam) && fullParam > 0 ? fullParam : DEFAULT_FULL_COLOR_COUNT;
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#FFD400]">
-      <VoxelVillage count={count} connected={connected} />
+      <VoxelVillage
+        count={count}
+        connected={connected}
+        closing={mode === "closing"}
+        fullColorCount={fullColorCount}
+      />
 
       <div className="pointer-events-none absolute inset-0 p-8 sm:p-12">
         <div className="grid grid-cols-3 items-start">
@@ -44,5 +56,13 @@ export default function VillagePage() {
 
       <ClosingScreen show={mode === "closing"} count={count} />
     </div>
+  );
+}
+
+export default function VillagePage() {
+  return (
+    <Suspense fallback={null}>
+      <VillageInner />
+    </Suspense>
   );
 }

@@ -1,17 +1,22 @@
 // Runtime simulation for the voxel villagers. Deliberately React-free: the
 // scene component owns one instance in a ref and calls update() from a single
 // useFrame loop, then copies the resulting transforms into InstancedMeshes.
-import { cellToWorld, pathFromSpawn, type VillageGraph } from "./village";
+//
+// Villagers drop into the town square and then stroll the streets, but only
+// through cells the colour front has reached — as more people join, more of
+// the island is painted and more of it opens up to walk in.
+import { DIRS4, cellToWorld, isWalkable, type Village, type VillageGraph } from "./village";
 import { mulberry32 } from "./prng";
 
 export const MAX_VILLAGERS = 600;
-/** How many villagers may share one outline cell once the ring is full. */
-export const CELL_CAPACITY = 3;
 
-const STEP_SECONDS = 0.34; // walking pace, seconds per cell (varied per villager)
+const STEP_SECONDS = 0.36; // walking pace, seconds per cell (varied per villager)
 const DROP_SECONDS = 0.7; // spawn animation: falls in from above like the mosaic's tiles
 const DROP_HEIGHT = 7;
 const GAIT_RATE = 10.5; // walk-cycle radians per second at pace 1
+const PAUSE_CHANCE = 0.09; // chance, on reaching a cell, of stopping for a moment
+const PAUSE_MIN = 0.6;
+const PAUSE_MAX = 2.6;
 
 // Clothing/skin palette, drawing from the app's greens + gold and warm earth tones.
 export const SHIRT_COLORS = [
@@ -22,12 +27,14 @@ export const SKIN_COLORS = [0x6b3f23, 0x8a5533, 0x4e2d18, 0xa5694a];
 export const HAIR_COLORS = [0x151210, 0x2a1c12, 0xe8b23c, 0x095d3e, 0xd94f3d];
 
 export type Villager = {
-  path: number[];
-  step: number;
+  cell: number;
+  next: number; // -1 while paused
+  dir: number; // index into DIRS4 of the last move
   stepStart: number;
   stepDur: number;
   spawnTime: number;
-  arrived: boolean;
+  dropping: boolean;
+  pauseUntil: number;
   // current pose
   x: number;
   y: number;
@@ -37,176 +44,179 @@ export type Villager = {
   walk: number; // 0..1 blend of the walk cycle
   phase: number; // walk-cycle phase
   gait: number; // pace multiplier
-  // lateral wobble inside the street so a crowd doesn't march single-file
+  // lateral offset inside the street so a crowd doesn't march single-file
   ox: number;
   oz: number;
-  // where it will stand forever
-  fx: number;
-  fz: number;
-  finalYaw: number;
   shirt: number;
   pants: number;
   skin: number;
   hair: number;
 };
 
-const GOLDEN = 0.6180339887498949;
-
 export class VillagerSystem {
   readonly villagers: Villager[] = [];
   now = 0;
   private readonly rand: () => number;
-  private occupancy: Uint8Array;
-  private pick = 0;
+  private readonly types: number[];
 
-  constructor(private readonly graph: VillageGraph) {
+  constructor(
+    private readonly graph: VillageGraph,
+    village: Village
+  ) {
     this.rand = mulberry32(20261003);
-    this.occupancy = new Uint8Array(graph.targets.length);
+    this.types = village.types;
   }
 
   get total() {
     return this.villagers.length;
   }
 
-  /** True once no more villagers can be placed (ring full at CELL_CAPACITY, or hard cap). */
-  get full() {
-    return this.villagers.length >= MAX_VILLAGERS || this.minOccupancy() >= CELL_CAPACITY;
-  }
-
   reset() {
     this.villagers.length = 0;
-    this.occupancy.fill(0);
-    this.pick = 0;
   }
 
-  private minOccupancy() {
-    let min = 255;
-    for (let i = 0; i < this.occupancy.length; i++) if (this.occupancy[i] < min) min = this.occupancy[i];
-    return this.occupancy.length ? min : 255;
+  /** A cell people may stand on right now: walkable, connected to the square, and painted. */
+  private open(i: number, radius: number) {
+    return isWalkable(this.types[i]) && this.graph.dist[i] !== -1 && this.graph.unlockRank[i] <= radius;
   }
 
   /**
-   * Choose the next outline cell. Rather than strictly nearest-first (which
-   * would clump the first hundred villagers into the corner nearest the spawn),
-   * targets are dealt around the ring with a golden-ratio sequence, so the
-   * border reads as Zimbabwe after just a dozen arrivals and fills in evenly.
-   * Once every cell has one villager, a second (then third) layer is added.
+   * Add one villager. `instant` seats it somewhere in the painted streets
+   * straight away (used when the page loads mid-event so the village reflects
+   * the existing count instead of replaying every arrival).
    */
-  private nextTarget(): { cell: number; slot: number } | null {
-    const n = this.graph.targets.length;
-    if (n === 0) return null;
-    const level = this.minOccupancy();
-    if (level >= CELL_CAPACITY) return null;
-    const start = Math.floor(((this.pick * GOLDEN) % 1) * n);
-    this.pick++;
-    for (let k = 0; k < n; k++) {
-      const i = (start + k) % n;
-      if (this.occupancy[i] === level) {
-        this.occupancy[i]++;
-        return { cell: this.graph.targets[i], slot: level };
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Add one villager. `instant` places it directly on its outline cell (used
-   * when the page loads mid-event so the border reflects the existing count).
-   */
-  spawn(instant: boolean): boolean {
+  spawn(instant: boolean, radius: number): boolean {
     if (this.villagers.length >= MAX_VILLAGERS) return false;
-    const target = this.nextTarget();
-    if (!target) return false;
     const g = this.graph;
     const r = this.rand;
-    const path = pathFromSpawn(g, target.cell);
 
-    const [tx, tz] = cellToWorld(g.cols, g.rows, target.cell);
-    const outX = g.outward[target.cell * 2];
-    const outZ = g.outward[target.cell * 2 + 1];
-    // extra occupants stand along the ring's tangent, either side of the first
-    const tangentX = -outZ;
-    const tangentZ = outX;
-    const side = target.slot === 0 ? 0 : target.slot === 1 ? 0.4 : -0.4;
-    const fx = tx + tangentX * side + outX * (0.12 - target.slot * 0.08) + (r() - 0.5) * 0.06;
-    const fz = tz + tangentZ * side + outZ * (0.12 - target.slot * 0.08) + (r() - 0.5) * 0.06;
-    const finalYaw = Math.atan2(outX, outZ);
-
-    const [sx, sz] = cellToWorld(g.cols, g.rows, g.spawnIndex);
-    const ox = (r() - 0.5) * 0.4;
-    const oz = (r() - 0.5) * 0.4;
+    let cell = g.spawnIndex;
+    if (instant) {
+      const candidates: number[] = [];
+      for (let i = 0; i < g.cols * g.rows; i++) if (this.open(i, radius)) candidates.push(i);
+      if (candidates.length) cell = candidates[Math.floor(r() * candidates.length)];
+    }
+    const [sx, sz] = cellToWorld(g.cols, g.rows, cell);
+    const ox = (r() - 0.5) * 0.44;
+    const oz = (r() - 0.5) * 0.44;
 
     const v: Villager = {
-      path,
-      step: 0,
+      cell,
+      next: -1,
+      dir: Math.floor(r() * 4),
       stepStart: this.now + DROP_SECONDS,
       stepDur: STEP_SECONDS * (0.85 + r() * 0.35),
       spawnTime: this.now,
-      arrived: instant,
-      x: instant ? fx : sx + ox,
+      dropping: !instant,
+      pauseUntil: instant ? this.now + r() * 1.5 : 0,
+      x: sx + ox,
       y: instant ? 0 : DROP_HEIGHT,
-      z: instant ? fz : sz + oz,
-      yaw: instant ? finalYaw : r() * Math.PI * 2,
-      targetYaw: finalYaw,
+      z: sz + oz,
+      yaw: r() * Math.PI * 2,
+      targetYaw: 0,
       walk: 0,
       phase: r() * Math.PI * 2,
       gait: 0.9 + r() * 0.25,
       ox,
       oz,
-      fx,
-      fz,
-      finalYaw,
       shirt: SHIRT_COLORS[Math.floor(r() * SHIRT_COLORS.length)],
       pants: PANTS_COLORS[Math.floor(r() * PANTS_COLORS.length)],
       skin: SKIN_COLORS[Math.floor(r() * SKIN_COLORS.length)],
       hair: HAIR_COLORS[Math.floor(r() * HAIR_COLORS.length)],
     };
+    v.targetYaw = v.yaw;
     this.villagers.push(v);
     return true;
   }
 
-  update(now: number, dt: number) {
+  /**
+   * Pick the next cell for a stroll: prefer carrying straight on, sometimes
+   * turn, only double back when there's nowhere else to go.
+   */
+  private chooseNext(v: Villager, radius: number): number {
+    const g = this.graph;
+    const cx = v.cell % g.cols;
+    const cy = (v.cell - cx) / g.cols;
+    const back = v.dir ^ 1; // DIRS4 pairs (+x,-x) and (+y,-y)
+    let totalW = 0;
+    const options: { cell: number; dir: number; w: number }[] = [];
+    for (let d = 0; d < 4; d++) {
+      const nx = cx + DIRS4[d][0];
+      const ny = cy + DIRS4[d][1];
+      if (nx < 0 || ny < 0 || nx >= g.cols || ny >= g.rows) continue;
+      const ni = ny * g.cols + nx;
+      if (!this.open(ni, radius)) continue;
+      const w = d === v.dir ? 3 : d === back ? 0.12 : 1;
+      options.push({ cell: ni, dir: d, w });
+      totalW += w;
+    }
+    if (!options.length) return -1;
+    let pick = this.rand() * totalW;
+    for (const o of options) {
+      pick -= o.w;
+      if (pick <= 0) {
+        v.dir = o.dir;
+        return o.cell;
+      }
+    }
+    v.dir = options[options.length - 1].dir;
+    return options[options.length - 1].cell;
+  }
+
+  update(now: number, dt: number, radius: number) {
     this.now = now;
     const g = this.graph;
     const turn = 1 - Math.exp(-10 * dt);
     const blend = 1 - Math.exp(-8 * dt);
 
     for (const v of this.villagers) {
-      if (!v.arrived) {
+      if (v.dropping) {
         const age = now - v.spawnTime;
         if (age < DROP_SECONDS) {
           const t = age / DROP_SECONDS;
           v.y = DROP_HEIGHT * (1 - t * t);
           v.walk += (0 - v.walk) * blend;
-        } else {
-          v.y = 0;
-          // advance along the path; a long frame may cover several cells
-          let p = (now - v.stepStart) / v.stepDur;
-          while (p >= 1 && !v.arrived) {
-            v.step++;
-            v.stepStart += v.stepDur;
-            if (v.step >= v.path.length - 1) {
-              v.arrived = true;
-            }
-            p = (now - v.stepStart) / v.stepDur;
-          }
-          if (!v.arrived) {
-            const [ax, az] = cellToWorld(g.cols, g.rows, v.path[v.step]);
-            const [bx, bz] = cellToWorld(g.cols, g.rows, v.path[v.step + 1]);
-            v.x = ax + (bx - ax) * p + v.ox;
-            v.z = az + (bz - az) * p + v.oz;
-            v.targetYaw = Math.atan2(bx - ax, bz - az);
-            v.walk += (1 - v.walk) * blend;
-          }
+          v.phase += dt * GAIT_RATE * 0.06;
+          continue;
         }
-      }
-      if (v.arrived) {
-        // ease onto the exact standing spot from wherever the last step left us
-        v.x += (v.fx - v.x) * blend;
-        v.z += (v.fz - v.z) * blend;
+        v.dropping = false;
         v.y = 0;
-        v.targetYaw = v.finalYaw;
+        v.stepStart = now;
+        v.next = this.chooseNext(v, radius);
+      }
+
+      if (v.next === -1) {
+        // paused (or boxed in): sway a little, then try to move on
         v.walk += (0 - v.walk) * blend;
+        if (now >= v.pauseUntil) {
+          v.next = this.chooseNext(v, radius);
+          v.stepStart = now;
+          if (v.next === -1) v.pauseUntil = now + 0.5;
+        }
+      } else {
+        let p = (now - v.stepStart) / v.stepDur;
+        while (p >= 1 && v.next !== -1) {
+          v.cell = v.next;
+          v.stepStart += v.stepDur;
+          if (this.rand() < PAUSE_CHANCE) {
+            v.next = -1;
+            v.pauseUntil = now + PAUSE_MIN + this.rand() * (PAUSE_MAX - PAUSE_MIN);
+            const [wx, wz] = cellToWorld(g.cols, g.rows, v.cell);
+            v.x = wx + v.ox;
+            v.z = wz + v.oz;
+            break;
+          }
+          v.next = this.chooseNext(v, radius);
+          p = (now - v.stepStart) / v.stepDur;
+        }
+        if (v.next !== -1) {
+          const [ax, az] = cellToWorld(g.cols, g.rows, v.cell);
+          const [bx, bz] = cellToWorld(g.cols, g.rows, v.next);
+          v.x = ax + (bx - ax) * p + v.ox;
+          v.z = az + (bz - az) * p + v.oz;
+          v.targetYaw = Math.atan2(bx - ax, bz - az);
+          v.walk += (1 - v.walk) * blend;
+        }
       }
 
       // shortest-arc yaw damping

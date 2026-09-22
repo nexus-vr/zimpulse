@@ -11,9 +11,20 @@ climbs throughout the event.
 | Route | Who uses it | What it does |
 |---|---|---|
 | `/display` | The LED wall / display screen | The particle installation, live counter, QR code, and closing screen. Open full-screen (`F11`/kiosk mode). |
+| `/village` | Alternative display | The isometric voxel village (see below). Same counter, same tap/QR panel, same backend. |
 | `/join` | Guest tablet(s) / QR scan | "Tap the heart to add your heartbeat." Fits the ~10–15s per-guest flow, auto-resets for the next guest. |
 | `/operator` | Event staff | PIN-gated console: simulate a test pulse, trigger the closing screen, reset the counter. |
-| `/` | Staff | Quick links to the three views above. |
+| `/` | Staff | Quick links to the views above. |
+
+### The village (`/village`)
+
+A Minecraft-style voxel city in the shape of Zimbabwe. It starts entirely
+white. Each heartbeat drops a new villager into the town square, paints a
+little more of the island outward from the square (people can only stroll
+through painted streets), and lifts every block into a heart before the island
+reassembles. By default the whole island is painted after 150 heartbeats;
+`/village?full=30` changes that (useful for demos with few taps). The
+generator (`scripts/generate-village.mjs`) writes `public/data/village.json`.
 
 ## Running it
 

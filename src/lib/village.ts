@@ -5,7 +5,7 @@
 export const CELL = {
   OUTSIDE: 0,
   STREET: 1,
-  EDGE: 2, // the outline ring villagers walk out to and stand on
+  EDGE: 2, // the outline ring around the island (walkable, never built on)
   BUILDING: 3,
   PLAZA: 4,
 } as const;
@@ -28,26 +28,31 @@ export async function loadVillage(): Promise<Village> {
   return res.json();
 }
 
+/** How many heartbeats it takes to paint the whole island, by default. */
+export const DEFAULT_FULL_COLOR_COUNT = 150;
+
 /**
- * Everything the runtime needs that can be derived once from the raw grid:
- * a BFS tree rooted at the spawn cell (so any villager's path is just a
- * parent-chain lookup), the list of reachable outline cells ordered around
- * the ring, and an outward-facing direction for each outline cell.
+ * Everything the runtime needs that can be derived once from the raw grid.
  */
 export type VillageGraph = {
   cols: number;
   rows: number;
   spawnIndex: number;
-  /** BFS parent over walkable cells (street + edge); -1 for spawn/unreachable. */
-  parent: Int32Array;
-  /** BFS distance in cells from spawn; -1 if unreachable. */
+  /** BFS distance in cells from spawn over walkable cells; -1 if unreachable. */
   dist: Int32Array;
   /** Manhattan distance (in cells) from the nearest outside cell, for every inside cell. */
   edgeDepth: Int32Array;
-  /** Reachable outline cells, ordered by angle around the island's centroid. */
-  targets: number[];
-  /** Unit outward direction (worldX, worldZ) per cell; only meaningful for outline cells. */
-  outward: Float32Array;
+  /**
+   * 0 at the town square rising to 1 at the far coast, following the island's
+   * own connectivity (BFS over every inside cell). Colour is "unlocked" for a
+   * cell once the colour radius passes its rank, so paint spreads outward.
+   */
+  unlockRank: Float32Array;
+  /** Rank one grid cell of BFS distance corresponds to (1 / max distance). */
+  unlockPerCell: number;
+  /** World-space (x, z) each cell moves to when the island reassembles as a heart. */
+  heartX: Float32Array;
+  heartZ: Float32Array;
   /** World-space bounds of the inside cells (cell centres +/- half a cell). */
   bounds: { minX: number; maxX: number; minZ: number; maxZ: number };
 };
@@ -63,7 +68,21 @@ export function cellToWorld(cols: number, rows: number, index: number): [number,
   return [gx - (cols - 1) / 2, -(gy - (rows - 1) / 2)];
 }
 
-const DIRS4 = [
+/**
+ * The colour radius (in unlock-rank units, 0..1) for a given heartbeat count.
+ * Nothing is painted at zero. The first heartbeat paints the town square; the
+ * curve then eases outward so early guests see a big change and the last few
+ * cells fill in gently. Slightly negative at zero so the soft edge of the
+ * paint front doesn't half-tint the spawn cell.
+ */
+export function colorRadiusFor(count: number, fullCount: number, g: VillageGraph) {
+  if (count <= 0) return -0.05;
+  const square = g.unlockPerCell * 4.5;
+  const t = Math.min(1, count / Math.max(1, fullCount));
+  return Math.min(1.02, square + (1.02 - square) * Math.pow(t, 0.7));
+}
+
+export const DIRS4 = [
   [1, 0],
   [-1, 0],
   [0, 1],
@@ -75,39 +94,47 @@ export function buildVillageGraph(v: Village): VillageGraph {
   const total = cols * rows;
   const spawnIndex = v.spawn.y * cols + v.spawn.x;
 
-  // --- BFS from spawn over walkable cells (4-connected) ---
-  const parent = new Int32Array(total).fill(-1);
-  const dist = new Int32Array(total).fill(-1);
-  const queue: number[] = [spawnIndex];
-  dist[spawnIndex] = 0;
-  for (let head = 0; head < queue.length; head++) {
-    const cur = queue[head];
-    const cx = cur % cols;
-    const cy = (cur - cx) / cols;
-    for (const [dx, dy] of DIRS4) {
-      const nx = cx + dx;
-      const ny = cy + dy;
-      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
-      const ni = ny * cols + nx;
-      if (dist[ni] !== -1 || !isWalkable(types[ni])) continue;
-      dist[ni] = dist[cur] + 1;
-      parent[ni] = cur;
-      queue.push(ni);
+  const bfs = (passable: (i: number) => boolean) => {
+    const d = new Int32Array(total).fill(-1);
+    const queue: number[] = [spawnIndex];
+    d[spawnIndex] = 0;
+    for (let head = 0; head < queue.length; head++) {
+      const cur = queue[head];
+      const cx = cur % cols;
+      const cy = (cur - cx) / cols;
+      for (const [dx, dy] of DIRS4) {
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        const ni = ny * cols + nx;
+        if (d[ni] !== -1 || !passable(ni)) continue;
+        d[ni] = d[cur] + 1;
+        queue.push(ni);
+      }
     }
+    return d;
+  };
+
+  // --- walkable connectivity from the spawn (streets + outline ring) ---
+  const dist = bfs((i) => isWalkable(types[i]));
+
+  // --- unlock order: BFS over every inside cell, so paint follows the land ---
+  const landDist = bfs((i) => types[i] !== CELL.OUTSIDE);
+  let maxLand = 1;
+  for (let i = 0; i < total; i++) if (landDist[i] > maxLand) maxLand = landDist[i];
+  const unlockRank = new Float32Array(total);
+  for (let i = 0; i < total; i++) {
+    unlockRank[i] = landDist[i] === -1 ? 1 : landDist[i] / maxLand;
   }
 
   // --- multi-source BFS from outside cells -> depth into the island ---
   const edgeDepth = new Int32Array(total).fill(-1);
   const q2: number[] = [];
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      const i = y * cols + x;
-      if (types[i] !== CELL.OUTSIDE) continue;
-      edgeDepth[i] = 0;
-      q2.push(i);
-    }
+  for (let i = 0; i < total; i++) {
+    if (types[i] !== CELL.OUTSIDE) continue;
+    edgeDepth[i] = 0;
+    q2.push(i);
   }
-  // grid border also counts as "outside"
   for (let head = 0; head < q2.length; head++) {
     const cur = q2[head];
     const cx = cur % cols;
@@ -145,61 +172,128 @@ export function buildVillageGraph(v: Village): VillageGraph {
   const cx = n ? sx / n : 0;
   const cz = n ? sz / n : 0;
 
-  // --- outward direction per outline cell ---
-  const outward = new Float32Array(total * 2);
-  for (let y = 0; y < rows; y++) {
-    for (let x = 0; x < cols; x++) {
-      const i = y * cols + x;
-      if (types[i] !== CELL.EDGE) continue;
-      let ox = 0;
-      let oz = 0;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          if (!dx && !dy) continue;
-          const nx = x + dx;
-          const ny = y + dy;
-          const outside =
-            nx < 0 || ny < 0 || nx >= cols || ny >= rows || types[ny * cols + nx] === CELL.OUTSIDE;
-          if (outside) {
-            ox += dx;
-            oz += -dy; // grid y is -world z
-          }
-        }
-      }
-      if (ox === 0 && oz === 0) {
-        const [wx, wz] = cellToWorld(cols, rows, i);
-        ox = wx - cx;
-        oz = wz - cz;
-      }
-      const len = Math.hypot(ox, oz) || 1;
-      outward[i * 2] = ox / len;
-      outward[i * 2 + 1] = oz / len;
-    }
-  }
+  const { heartX, heartZ } = buildHeartTargets(v, cx, cz);
 
-  // --- reachable outline cells, ordered around the ring ---
-  const targets: number[] = [];
-  for (let i = 0; i < total; i++) {
-    if (types[i] === CELL.EDGE && dist[i] !== -1) targets.push(i);
-  }
-  const angleOf = (i: number) => {
-    const [wx, wz] = cellToWorld(cols, rows, i);
-    return Math.atan2(wz - cz, wx - cx);
+  return {
+    cols,
+    rows,
+    spawnIndex,
+    dist,
+    edgeDepth,
+    unlockRank,
+    unlockPerCell: 1 / maxLand,
+    heartX,
+    heartZ,
+    bounds,
   };
-  targets.sort((a, b) => angleOf(a) - angleOf(b));
-
-  return { cols, rows, spawnIndex, parent, dist, edgeDepth, targets, outward, bounds };
 }
 
-/** Cell indices from spawn (inclusive) to `target` (inclusive), via the BFS tree. */
-export function pathFromSpawn(g: VillageGraph, target: number): number[] {
-  const path: number[] = [];
-  let cur = target;
-  while (cur !== -1) {
-    path.push(cur);
-    if (cur === g.spawnIndex) break;
-    cur = g.parent[cur];
+// ---------------------------------------------------------------------------
+// Heart mapping. Every inside cell gets a spot inside a heart of (roughly) the
+// same area, centred on the island. Rows of the island map to rows of the
+// heart by cumulative cell count (equal-area), spread continuously along each
+// heart row's spans, so blocks travel coherently and don't pile up.
+// ---------------------------------------------------------------------------
+
+function heartInside(x: number, y: number) {
+  const a = x * x + y * y - 1;
+  return a * a * a - x * x * y * y * y <= 0;
+}
+
+type Span = { start: number; len: number };
+
+function rasterHeart(scale: number) {
+  const r = Math.ceil(1.4 * scale);
+  const rows: { j: number; spans: Span[]; count: number }[] = [];
+  let total = 0;
+  for (let j = -r; j <= r; j++) {
+    const spans: Span[] = [];
+    let run = -1;
+    for (let i = -r; i <= r + 1; i++) {
+      const inside = i <= r && heartInside(i / scale, j / scale);
+      if (inside && run === -1) run = i;
+      if (!inside && run !== -1) {
+        spans.push({ start: run, len: i - run });
+        run = -1;
+      }
+    }
+    if (spans.length) {
+      const count = spans.reduce((s, sp) => s + sp.len, 0);
+      rows.push({ j, spans, count });
+      total += count;
+    }
   }
-  path.reverse();
-  return path;
+  return { rows, total };
+}
+
+function buildHeartTargets(v: Village, cx: number, cz: number) {
+  const { gridCols: cols, gridRows: rows, types } = v;
+  const total = cols * rows;
+  const heartX = new Float32Array(total);
+  const heartZ = new Float32Array(total);
+
+  // island rows, south -> north, each west -> east
+  const islandRows: number[][] = [];
+  let islandCount = 0;
+  for (let gy = 0; gy < rows; gy++) {
+    const row: number[] = [];
+    for (let gx = 0; gx < cols; gx++) {
+      const i = gy * cols + gx;
+      if (types[i] !== CELL.OUTSIDE) row.push(i);
+    }
+    if (row.length) {
+      islandRows.push(row);
+      islandCount += row.length;
+    }
+  }
+  if (!islandCount) return { heartX, heartZ };
+
+  // scale the heart until it holds about as many cells as the island
+  let lo = 4;
+  let hi = 80;
+  for (let k = 0; k < 24; k++) {
+    const mid = (lo + hi) / 2;
+    if (rasterHeart(mid).total < islandCount) lo = mid;
+    else hi = mid;
+  }
+  const heart = rasterHeart((lo + hi) / 2);
+  const hRows = heart.rows;
+  // cumulative fraction at the middle of each heart row
+  const hMid: number[] = [];
+  let acc = 0;
+  for (const hr of hRows) {
+    hMid.push((acc + hr.count / 2) / heart.total);
+    acc += hr.count;
+  }
+
+  let before = 0;
+  for (const row of islandRows) {
+    const f = (before + row.length / 2) / islandCount;
+    before += row.length;
+
+    // continuous heart-row position for this island row
+    let b = 0;
+    while (b < hRows.length - 2 && hMid[b + 1] <= f) b++;
+    const span = Math.max(1e-6, hMid[b + 1] - hMid[b]);
+    const frac = Math.min(1, Math.max(0, (f - hMid[b]) / span));
+    const jCont = hRows[b].j + frac * (hRows[b + 1].j - hRows[b].j);
+    const useRow = frac < 0.5 ? hRows[b] : hRows[b + 1];
+
+    const L = useRow.count;
+    for (let p = 0; p < row.length; p++) {
+      const q = ((p + 0.5) / row.length) * L;
+      let along = q;
+      let sp = useRow.spans[0];
+      for (const s of useRow.spans) {
+        sp = s;
+        if (along <= s.len) break;
+        along -= s.len;
+      }
+      const xh = sp.start - 0.5 + along;
+      const i = row[p];
+      heartX[i] = cx + xh;
+      heartZ[i] = cz - jCont;
+    }
+  }
+  return { heartX, heartZ };
 }

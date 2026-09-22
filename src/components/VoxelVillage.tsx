@@ -6,13 +6,16 @@ import { OrthographicCamera } from "@react-three/drei";
 import * as THREE from "three";
 import {
   CELL,
+  DEFAULT_FULL_COLOR_COUNT,
   buildVillageGraph,
   cellToWorld,
+  colorRadiusFor,
   loadVillage,
   type Village,
   type VillageGraph,
 } from "@/lib/village";
 import { MAX_VILLAGERS, VillagerSystem } from "@/lib/villagers";
+import { FX_ATTRIBUTES, VillageFx, augmentVillageMaterial } from "@/lib/villageFx";
 import { mulberry32 } from "@/lib/prng";
 
 const BACKGROUND = "#FFD400";
@@ -24,60 +27,102 @@ const BACKGROUND = "#FFD400";
 const WALL_COLORS = [
   "#f1e3c6", "#dcab6f", "#cd7a42", "#bb593b", "#e3bb6d", "#a97d5c",
   "#f5ecd9", "#d2925c", "#0E8C5C", "#ebcaa2", "#c9a27a", "#e6d2b0",
+  "#b8433a", "#7c9a6d", "#d9c7a3", "#c46a3a",
 ];
-const ROOF_COLORS = ["#095D3E", "#e8b23c", "#8a3b22", "#2f6f4e", "#c2552f", "#0E8C5C", "#d99a2b"];
-const LEAF_COLORS = ["#0E8C5C", "#0b7a4e", "#14b87c", "#2f9e5a", "#095D3E"];
+const ROOF_COLORS = ["#095D3E", "#e8b23c", "#8a3b22", "#2f6f4e", "#c2552f", "#0E8C5C", "#d99a2b", "#5b4436"];
+const LEAF_COLORS = ["#0E8C5C", "#0b7a4e", "#14b87c", "#2f9e5a", "#095D3E", "#6fae3e"];
 const GROUND = {
   street: "#e4cb9f",
   square: "#d9b98a", // paved town square around the spawn point
   edge: "#a97f4c",
   building: "#a08662",
   plaza: "#55b06e",
+  farm: "#8c6a3d",
+  market: "#dcc59b",
 };
 const DIRT = "#8f5b35";
+const WATER = "#3aa6c9";
+const THATCH = "#c9a45c";
 const HEIGHT_SCALE = 0.5; // world units per storey; keeps towers from hiding the streets behind them
 const STONE = "#9a8f82";
 const TRUNK = "#5a3b26";
 
 // ---------------------------------------------------------------------------
-// Terrain: every voxel is an instance of one unit cube. Built once, purely
-// from the grid + a seeded PRNG (React Compiler friendly), then handed to r3f
-// as <primitive> objects.
+// Terrain: every voxel is an instance of a shared unit shape, tagged with the
+// grid cell it belongs to so the whole cell (ground, building, windows, trees)
+// travels together when the island reassembles as a heart. Built once, purely
+// from the grid + a seeded PRNG (React Compiler friendly).
 // ---------------------------------------------------------------------------
-type Item = { x: number; y: number; z: number; sx: number; sy: number; sz: number; color: THREE.Color };
+type Item = {
+  cell: number;
+  x: number;
+  y: number;
+  z: number;
+  sx: number;
+  sy: number;
+  sz: number;
+  color: THREE.Color;
+};
 
-function item(x: number, y: number, z: number, sx: number, sy: number, sz: number, color: THREE.Color): Item {
-  return { x, y, z, sx, sy, sz, color: color.clone() };
-}
+type Bucket = { items: Item[]; geometry: THREE.BufferGeometry; lit: boolean; cast: boolean; receive: boolean };
 
-function makeInstanced(
-  geometry: THREE.BufferGeometry,
-  material: THREE.Material,
-  items: Item[],
-  shadows: { cast: boolean; receive: boolean }
-) {
-  const mesh = new THREE.InstancedMesh(geometry, material, Math.max(items.length, 1));
+function makeInstanced(bucket: Bucket, graph: VillageGraph, fx: VillageFx, rand: () => number) {
+  const { items } = bucket;
+  const n = Math.max(items.length, 1);
+  const geometry = bucket.geometry.clone();
+  const heart = new Float32Array(n * 3);
+  const scatter = new Float32Array(n * 3);
+  const unlock = new Float32Array(n * 2);
+
+  const material = bucket.lit
+    ? new THREE.MeshBasicMaterial({ color: "#ffffff" })
+    : new THREE.MeshLambertMaterial({ color: "#ffffff" });
+  augmentVillageMaterial(material, fx, true);
+  const depth = augmentVillageMaterial(
+    new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking }),
+    fx,
+    false
+  );
+
+  const mesh = new THREE.InstancedMesh(geometry, material, n);
   const m = new THREE.Matrix4();
   const p = new THREE.Vector3();
   const s = new THREE.Vector3();
   const q = new THREE.Quaternion();
   items.forEach((it, i) => {
-    p.set(it.x, it.y + it.sy / 2, it.z);
+    const cy = it.y + it.sy / 2;
+    p.set(it.x, cy, it.z);
     s.set(it.sx, it.sy, it.sz);
     m.compose(p, q, s);
     mesh.setMatrixAt(i, m);
     mesh.setColorAt(i, it.color);
+
+    const [wx, wz] = cellToWorld(graph.cols, graph.rows, it.cell);
+    heart[i * 3] = graph.heartX[it.cell] + (it.x - wx);
+    heart[i * 3 + 1] = cy;
+    heart[i * 3 + 2] = graph.heartZ[it.cell] + (it.z - wz);
+    scatter[i * 3] = (rand() - 0.5) * 3;
+    scatter[i * 3 + 1] = 1.5 + rand() * 4;
+    scatter[i * 3 + 2] = (rand() - 0.5) * 3;
+    const rank = graph.unlockRank[it.cell];
+    unlock[i * 2] = rank;
+    unlock[i * 2 + 1] = Math.min(1, rank + (rand() - 0.5) * 0.06);
   });
+  geometry.setAttribute(FX_ATTRIBUTES.heart, new THREE.InstancedBufferAttribute(heart, 3));
+  geometry.setAttribute(FX_ATTRIBUTES.scatter, new THREE.InstancedBufferAttribute(scatter, 3));
+  geometry.setAttribute(FX_ATTRIBUTES.unlock, new THREE.InstancedBufferAttribute(unlock, 2));
+
   mesh.count = items.length;
   mesh.instanceMatrix.needsUpdate = true;
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  mesh.castShadow = shadows.cast;
-  mesh.receiveShadow = shadows.receive;
+  mesh.castShadow = bucket.cast;
+  mesh.receiveShadow = bucket.receive;
+  mesh.customDepthMaterial = depth;
   mesh.frustumCulled = false;
-  return mesh;
+  return { mesh, dispose: () => { mesh.dispose(); geometry.dispose(); material.dispose(); depth.dispose(); } };
 }
 
-function buildTerrain(village: Village, graph: VillageGraph) {
+function buildTerrain(village: Village, graph: VillageGraph, fx: VillageFx) {
   const { gridCols: cols, gridRows: rows, types, heights, colorSeed } = village;
   const rand = mulberry32(8675309);
   const c = new THREE.Color();
@@ -87,37 +132,65 @@ function buildTerrain(village: Village, graph: VillageGraph) {
     return c;
   };
 
-  const dirt: Item[] = [];
-  const tiles: Item[] = [];
-  const walls: Item[] = [];
-  const roofs: Item[] = [];
-  const darkWindows: Item[] = [];
-  const litWindows: Item[] = [];
-  const trunks: Item[] = [];
-  const leaves: Item[] = [];
-  const stones: Item[] = [];
+  const unit = new THREE.BoxGeometry(1, 1, 1);
+  const cylinder = new THREE.CylinderGeometry(0.5, 0.5, 1, 8);
+  const cone = new THREE.ConeGeometry(0.5, 1, 8);
 
-  // A small dry-stone tower beside the spawn point marks where villagers
-  // appear (a quiet nod to Great Zimbabwe's conical tower).
-  let landmark = -1;
-  {
-    const sx = village.spawn.x;
-    const sy = village.spawn.y;
-    let best = Infinity;
-    for (let dy = -2; dy <= 2; dy++) {
-      for (let dx = -2; dx <= 2; dx++) {
-        const nx = sx + dx;
-        const ny = sy + dy;
-        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
-        const i = ny * cols + nx;
-        const d = Math.abs(dx) + Math.abs(dy);
-        if (types[i] === CELL.BUILDING && d < best) {
-          best = d;
-          landmark = i;
-        }
+  const bucket = (geometry: THREE.BufferGeometry, cast: boolean, receive: boolean, lit = false): Bucket => ({
+    items: [],
+    geometry,
+    lit,
+    cast,
+    receive,
+  });
+  const dirt = bucket(unit, false, false);
+  const tiles = bucket(unit, false, true);
+  const walls = bucket(unit, true, true);
+  const roofs = bucket(unit, true, true);
+  const darkWindows = bucket(unit, false, false);
+  const litWindows = bucket(unit, false, false, true);
+  const trunks = bucket(unit, true, false);
+  const leaves = bucket(unit, true, true);
+  const stones = bucket(unit, true, true);
+  const huts = bucket(cylinder, true, true);
+  const thatch = bucket(cone, true, true);
+  const water = bucket(unit, false, true);
+
+  let cell = 0;
+  const put = (b: Bucket, x: number, y: number, z: number, sx: number, sy: number, sz: number, color: THREE.Color) =>
+    b.items.push({ cell, x, y, z, sx, sy, sz, color: color.clone() });
+
+  const tree = (x: number, z: number, scale: number) => {
+    const trunkH = 0.45 * scale;
+    put(trunks, x, 0, z, 0.16 * scale, trunkH, 0.16 * scale, vary(TRUNK, 0.01, 0.06));
+    const leaf = LEAF_COLORS[Math.floor(rand() * LEAF_COLORS.length)];
+    const a = 0.72 * scale;
+    put(leaves, x, trunkH, z, a, a, a, vary(leaf, 0.02, 0.06));
+    const b = 0.42 * scale;
+    put(leaves, x, trunkH + a - 0.02, z, b, b, b, vary(leaf, 0.02, 0.06));
+  };
+
+  const windowsOn = (wx: number, wz: number, fp: number, storeys: number, narrow: boolean) => {
+    const ww = narrow ? 0.18 : 0.26;
+    for (let f = 0; f < storeys; f++) {
+      const wy = f * HEIGHT_SCALE + 0.13;
+      const lit = rand() < 0.65;
+      c.set(lit ? (rand() < 0.5 ? "#ffe6a6" : "#ffd27a") : "#1d3b34");
+      put(lit ? litWindows : darkWindows, wx + fp / 2 + 0.01, wy, wz + (rand() - 0.5) * 0.25, 0.04, 0.28, ww, c);
+      if (f === 0) {
+        c.set("#3d2a1a");
+        put(darkWindows, wx + (rand() - 0.5) * 0.2, 0, wz + fp / 2 + 0.01, 0.28, 0.5, 0.04, c);
+      } else {
+        const lit2 = rand() < 0.65;
+        c.set(lit2 ? (rand() < 0.5 ? "#ffe6a6" : "#ffd27a") : "#1d3b34");
+        put(lit2 ? litWindows : darkWindows, wx + (rand() - 0.5) * 0.25, wy, wz + fp / 2 + 0.01, ww, 0.28, 0.04, c);
       }
     }
-  }
+  };
+
+  // The landmark: a dry-stone tower on the plot the generator reserved beside
+  // the spawn (a quiet nod to Great Zimbabwe's conical tower).
+  const landmark = (village.spawn.y + 1) * cols + village.spawn.x;
 
   let maxDepth = 1;
   for (let i = 0; i < cols * rows; i++) if (graph.edgeDepth[i] > maxDepth) maxDepth = graph.edgeDepth[i];
@@ -125,53 +198,76 @@ function buildTerrain(village: Village, graph: VillageGraph) {
   for (let i = 0; i < cols * rows; i++) {
     const t = types[i];
     if (t === CELL.OUTSIDE) continue;
+    cell = i;
     const [wx, wz] = cellToWorld(cols, rows, i);
+    const gx = i % cols;
+    const gy = (i - gx) / cols;
+    const inSquare = Math.max(Math.abs(gx - village.spawn.x), Math.abs(gy - village.spawn.y)) <= 3;
 
     // --- floating-island underside: rugged dirt columns, deeper inland ---
     const depth01 = Math.min(1, graph.edgeDepth[i] / (maxDepth * 0.6));
     const d = 1.4 + depth01 * 3.2 + rand() * 0.9;
     c.set(DIRT);
     c.offsetHSL((rand() - 0.5) * 0.02, 0, (rand() - 0.5) * 0.08 - depth01 * 0.08);
-    dirt.push(item(wx, -d, wz, 1, d - 0.5, 1, c));
-
-    // --- surface tile ---
-    const gx = i % cols;
-    const gy = (i - gx) / cols;
-    const inSquare = Math.max(Math.abs(gx - village.spawn.x), Math.abs(gy - village.spawn.y)) <= 3;
-    const groundHex =
-      t === CELL.STREET
-        ? inSquare
-          ? GROUND.square
-          : GROUND.street
-        : t === CELL.EDGE
-          ? GROUND.edge
-          : t === CELL.PLAZA
-            ? GROUND.plaza
-            : GROUND.building;
-    tiles.push(item(wx, -0.5, wz, 1, 0.5, 1, vary(groundHex, 0.01, t === CELL.PLAZA ? 0.05 : 0.035)));
+    put(dirt, wx, -d, wz, 1, d - 0.5, 1, c);
 
     if (t === CELL.PLAZA) {
-      // a little park: one or two blocky trees
-      const trees = rand() < 0.35 ? 2 : 1;
-      for (let k = 0; k < trees; k++) {
-        const ox = trees === 1 ? (rand() - 0.5) * 0.3 : (k === 0 ? -0.24 : 0.24) + (rand() - 0.5) * 0.1;
-        const oz = trees === 1 ? (rand() - 0.5) * 0.3 : (k === 0 ? 0.2 : -0.2) + (rand() - 0.5) * 0.1;
-        const scale = trees === 1 ? 0.85 + rand() * 0.35 : 0.6 + rand() * 0.25;
-        const trunkH = 0.45 * scale;
-        trunks.push(item(wx + ox, 0, wz + oz, 0.16 * scale, trunkH, 0.16 * scale, vary(TRUNK, 0.01, 0.06)));
-        const leaf = LEAF_COLORS[Math.floor(rand() * LEAF_COLORS.length)];
-        const a = 0.72 * scale;
-        leaves.push(item(wx + ox, trunkH, wz + oz, a, a, a, vary(leaf, 0.02, 0.06)));
-        const b = 0.42 * scale;
-        leaves.push(item(wx + ox, trunkH + a - 0.02, wz + oz, b, b, b, vary(leaf, 0.02, 0.06)));
+      const kind = rand();
+      if (kind < 0.18) {
+        // pond: a sunken water tile with a reed and a tree on the bank
+        put(tiles, wx, -0.5, wz, 1, 0.5, 1, vary(GROUND.plaza, 0.01, 0.05));
+        put(water, wx, -0.1, wz, 0.78, 0.08, 0.78, vary(WATER, 0.02, 0.06));
+        c.set("#3d8a3a");
+        put(trunks, wx + 0.22, 0, wz - 0.2, 0.05, 0.3, 0.05, c);
+        tree(wx - 0.32, wz + 0.3, 0.6);
+      } else if (kind < 0.38) {
+        // smallholding: rows of crops in alternating greens and gold
+        put(tiles, wx, -0.5, wz, 1, 0.5, 1, vary(GROUND.farm, 0.01, 0.04));
+        for (let k = 0; k < 3; k++) {
+          const crop = k % 2 === 0 ? "#4f9a3a" : rand() < 0.5 ? "#e8b23c" : "#7fbf4a";
+          put(leaves, wx, 0, wz - 0.3 + k * 0.3, 0.86, 0.12 + rand() * 0.08, 0.16, vary(crop, 0.03, 0.08));
+        }
+      } else if (kind < 0.5) {
+        // little market: a paved lot with a striped awning stall
+        put(tiles, wx, -0.5, wz, 1, 0.5, 1, vary(GROUND.market, 0.01, 0.04));
+        c.set("#5a3b26");
+        put(trunks, wx - 0.3, 0, wz - 0.25, 0.06, 0.55, 0.06, c);
+        put(trunks, wx + 0.3, 0, wz - 0.25, 0.06, 0.55, 0.06, c);
+        put(roofs, wx, 0.55, wz - 0.25, 0.86, 0.06, 0.5, vary(rand() < 0.5 ? "#d94f3d" : "#e8b23c", 0.01, 0.04));
+        put(walls, wx, 0, wz + 0.15, 0.7, 0.3, 0.3, vary("#c9a27a", 0.01, 0.05));
+        if (rand() < 0.6) tree(wx + 0.34, wz + 0.32, 0.55);
+      } else {
+        // park: one to three blocky trees, sometimes a rock
+        put(tiles, wx, -0.5, wz, 1, 0.5, 1, vary(GROUND.plaza, 0.01, 0.05));
+        const trees = kind < 0.68 ? 3 : kind < 0.86 ? 2 : 1;
+        for (let k = 0; k < trees; k++) {
+          const ang = (k / trees) * Math.PI * 2 + rand();
+          const rad = trees === 1 ? 0 : 0.26;
+          tree(
+            wx + Math.cos(ang) * rad + (rand() - 0.5) * 0.08,
+            wz + Math.sin(ang) * rad + (rand() - 0.5) * 0.08,
+            trees === 1 ? 0.9 + rand() * 0.3 : 0.55 + rand() * 0.25
+          );
+        }
+        if (rand() < 0.3) put(stones, wx + (rand() - 0.5) * 0.5, 0, wz + (rand() - 0.5) * 0.5, 0.18, 0.12, 0.14, vary(STONE, 0.01, 0.08));
       }
       continue;
     }
 
+    // --- surface tile for everything else ---
+    const groundHex =
+      t === CELL.STREET ? (inSquare ? GROUND.square : GROUND.street) : t === CELL.EDGE ? GROUND.edge : GROUND.building;
+    put(tiles, wx, -0.5, wz, 1, 0.5, 1, vary(groundHex, 0.01, 0.035));
+
+    if (t === CELL.STREET) {
+      // the occasional street tree, tucked to one side so the road stays open
+      if (!inSquare && rand() < 0.05) tree(wx + 0.4, wz + (rand() - 0.5) * 0.6, 0.45);
+      continue;
+    }
     if (t !== CELL.BUILDING) continue;
 
     if (i === landmark) {
-      const tiers = [
+      const tiers: [number, number][] = [
         [0.98, 1.1],
         [0.84, 1.0],
         [0.7, 1.0],
@@ -181,84 +277,114 @@ function buildTerrain(village: Village, graph: VillageGraph) {
       ];
       let y = 0;
       for (const [w, h] of tiers) {
-        stones.push(item(wx, y, wz, w, h, w, vary(STONE, 0.01, 0.07)));
+        put(stones, wx, y, wz, w, h, w, vary(STONE, 0.01, 0.07));
         y += h;
       }
       continue;
     }
 
-    // --- building ---
+    // --- buildings, in a few distinct kinds ---
     const storeys = heights[i];
-    const h = storeys * HEIGHT_SCALE;
     const seed = colorSeed[i];
     const wallHex = WALL_COLORS[Math.floor(seed * WALL_COLORS.length) % WALL_COLORS.length];
     const roofHex = ROOF_COLORS[Math.floor(((seed * 13.37) % 1) * ROOF_COLORS.length) % ROOF_COLORS.length];
-    const fp = 0.82; // footprint, leaving alleys between neighbours
+    const kindRoll = (seed * 7.77) % 1;
+
+    if (storeys <= 2 && kindRoll < 0.22) {
+      // rondavel homestead: one or two round huts with thatched cones
+      const count = kindRoll < 0.1 ? 2 : 1;
+      for (let k = 0; k < count; k++) {
+        const hx = wx + (count === 1 ? 0 : k === 0 ? -0.22 : 0.24);
+        const hz = wz + (count === 1 ? 0 : k === 0 ? 0.18 : -0.2);
+        const rad = count === 1 ? 0.72 : 0.46;
+        const wallH = count === 1 ? 0.5 : 0.42;
+        put(huts, hx, 0, hz, rad, wallH, rad, vary(rand() < 0.5 ? "#e3bb6d" : "#c9763f", 0.01, 0.05));
+        put(thatch, hx, wallH, hz, rad + 0.16, 0.42 + rand() * 0.14, rad + 0.16, vary(THATCH, 0.015, 0.06));
+      }
+      if (rand() < 0.5) tree(wx + 0.36, wz + 0.34, 0.4);
+      continue;
+    }
+
+    if (storeys <= 2) {
+      // house: modest footprint, stepped pitched roof, sometimes a chimney
+      const fp = 0.78;
+      const h = storeys * HEIGHT_SCALE;
+      const wall = vary(wallHex, 0.012, 0.06).clone();
+      put(walls, wx, 0, wz, fp, h, fp, wall);
+      const roof = vary(roofHex, 0.01, 0.05).clone();
+      put(roofs, wx, h, wz, fp + 0.14, 0.14, fp + 0.14, roof);
+      put(roofs, wx, h + 0.14, wz, fp - 0.12, 0.14, fp + 0.02, roof);
+      put(roofs, wx, h + 0.28, wz, fp - 0.42, 0.14, fp - 0.1, roof);
+      if (rand() < 0.4) {
+        c.set("#6b4a3a");
+        put(walls, wx + 0.22, h + 0.2, wz - 0.18, 0.12, 0.3, 0.12, c);
+      }
+      windowsOn(wx, wz, fp, storeys, false);
+      continue;
+    }
+
+    if (storeys >= 5) {
+      // tower: slim, one storey taller, capped with a spire
+      const fp = 0.62;
+      const h = (storeys + 1) * HEIGHT_SCALE;
+      const wall = vary(wallHex, 0.012, 0.06).clone();
+      put(walls, wx, 0, wz, fp, h, fp, wall);
+      c.copy(wall).offsetHSL(0, 0, -0.08);
+      put(walls, wx, h * 0.55, wz, fp + 0.04, 0.08, fp + 0.04, c); // a band
+      put(roofs, wx, h, wz, fp + 0.1, 0.14, fp + 0.1, vary(roofHex, 0.01, 0.05));
+      c.set("#e8b23c");
+      put(roofs, wx, h + 0.14, wz, 0.08, 0.7, 0.08, c);
+      windowsOn(wx, wz, fp, storeys + 1, true);
+      continue;
+    }
+
+    if (kindRoll < 0.5) {
+      // stepped block: a wide base with a narrower upper storey set back
+      const fp = 0.86;
+      const lower = Math.max(1, storeys - 1) * HEIGHT_SCALE;
+      const upper = HEIGHT_SCALE * 1.2;
+      const wall = vary(wallHex, 0.012, 0.06).clone();
+      put(walls, wx, 0, wz, fp, lower, fp, wall);
+      put(roofs, wx, lower, wz, fp + 0.08, 0.12, fp + 0.08, vary(roofHex, 0.01, 0.05));
+      c.copy(wall).offsetHSL(0.01, 0, 0.05);
+      const ox = (rand() - 0.5) * 0.2;
+      const oz = (rand() - 0.5) * 0.2;
+      put(walls, wx + ox, lower + 0.12, wz + oz, fp * 0.62, upper, fp * 0.62, c);
+      put(roofs, wx + ox, lower + 0.12 + upper, wz + oz, fp * 0.62 + 0.08, 0.12, fp * 0.62 + 0.08, vary(roofHex, 0.01, 0.05));
+      windowsOn(wx, wz, fp, storeys - 1, false);
+      continue;
+    }
+
+    // apartment block: flat roof with a parapet and a stair-head
+    const fp = 0.82;
+    const h = storeys * HEIGHT_SCALE;
     const wall = vary(wallHex, 0.012, 0.06).clone();
-    walls.push(item(wx, 0, wz, fp, h, fp, wall));
-
-    // roof slab with a slight overhang
-    roofs.push(item(wx, h, wz, fp + 0.1, 0.16, fp + 0.1, vary(roofHex, 0.01, 0.05)));
-
-    // rooftop detail on taller buildings: a stair-head / water tank block
-    if (storeys >= 3 && (seed * 5.1) % 1 > 0.5) {
+    put(walls, wx, 0, wz, fp, h, fp, wall);
+    put(roofs, wx, h, wz, fp + 0.1, 0.16, fp + 0.1, vary(roofHex, 0.01, 0.05));
+    if ((seed * 5.1) % 1 > 0.45) {
       const pw = 0.4;
       const ph = 0.4 + rand() * 0.4;
-      const px = (rand() - 0.5) * 0.3;
-      const pz = (rand() - 0.5) * 0.3;
       c.copy(wall).offsetHSL(0, 0, -0.06);
-      walls.push(item(wx + px, h + 0.16, wz + pz, pw, ph, pw, c));
+      put(walls, wx + (rand() - 0.5) * 0.3, h + 0.16, wz + (rand() - 0.5) * 0.3, pw, ph, pw, c);
     }
-
-    // windows on the two camera-facing faces (+x east, +z south), one per floor
-    for (let f = 0; f < storeys; f++) {
-      const wy = f * HEIGHT_SCALE + 0.13;
-      const isDoor = f === 0;
-      const litColor = rand() < 0.65;
-      const winA = litColor ? litWindows : darkWindows;
-      c.set(litColor ? (rand() < 0.5 ? "#ffe6a6" : "#ffd27a") : "#1d3b34");
-      winA.push(item(wx + fp / 2 + 0.01, wy, wz + (rand() - 0.5) * 0.25, 0.04, 0.28, 0.26, c));
-
-      if (isDoor) {
-        c.set("#3d2a1a");
-        darkWindows.push(item(wx + (rand() - 0.5) * 0.2, 0, wz + fp / 2 + 0.01, 0.28, 0.5, 0.04, c));
-      } else {
-        const lit2 = rand() < 0.65;
-        c.set(lit2 ? (rand() < 0.5 ? "#ffe6a6" : "#ffd27a") : "#1d3b34");
-        (lit2 ? litWindows : darkWindows).push(
-          item(wx + (rand() - 0.5) * 0.25, wy, wz + fp / 2 + 0.01, 0.26, 0.28, 0.04, c)
-        );
-      }
-    }
+    windowsOn(wx, wz, fp, storeys, false);
   }
 
-  const unit = new THREE.BoxGeometry(1, 1, 1);
-  const lambert = new THREE.MeshLambertMaterial({ color: "#ffffff" });
-  const glow = new THREE.MeshBasicMaterial({ color: "#ffffff" });
-
-  const meshes = [
-    makeInstanced(unit, lambert, dirt, { cast: false, receive: false }),
-    makeInstanced(unit, lambert, tiles, { cast: false, receive: true }),
-    makeInstanced(unit, lambert, walls, { cast: true, receive: true }),
-    makeInstanced(unit, lambert, roofs, { cast: true, receive: true }),
-    makeInstanced(unit, lambert, darkWindows, { cast: false, receive: false }),
-    makeInstanced(unit, glow, litWindows, { cast: false, receive: false }),
-    makeInstanced(unit, lambert, trunks, { cast: true, receive: false }),
-    makeInstanced(unit, lambert, leaves, { cast: true, receive: true }),
-    makeInstanced(unit, lambert, stones, { cast: true, receive: true }),
-  ];
-
+  const built = [dirt, tiles, walls, roofs, darkWindows, litWindows, trunks, leaves, stones, huts, thatch, water].map(
+    (b) => makeInstanced(b, graph, fx, rand)
+  );
+  const meshes = built.map((b) => b.mesh);
   const dispose = () => {
-    meshes.forEach((m) => m.dispose());
+    built.forEach((b) => b.dispose());
     unit.dispose();
-    lambert.dispose();
-    glow.dispose();
+    cylinder.dispose();
+    cone.dispose();
   };
   return { meshes, dispose };
 }
 
-function Terrain({ village, graph }: { village: Village; graph: VillageGraph }) {
-  const terrain = useMemo(() => buildTerrain(village, graph), [village, graph]);
+function Terrain({ village, graph, fx }: { village: Village; graph: VillageGraph; fx: VillageFx }) {
+  const terrain = useMemo(() => buildTerrain(village, graph, fx), [village, graph, fx]);
   useEffect(() => () => terrain.dispose(), [terrain]);
   return (
     <>
@@ -274,7 +400,7 @@ function Terrain({ village, graph }: { village: Village; graph: VillageGraph }) 
 // 32px body). Each body part is one InstancedMesh with MAX_VILLAGERS slots;
 // every frame we compose root * pivot * swing for the active villagers only.
 // ---------------------------------------------------------------------------
-const PX = 2.1 / 32; // world units per "pixel"; figures are toy-scale (~2 blocks tall) so the border of people reads from across the room
+const PX = 2.1 / 32; // world units per "pixel"; figures are toy-scale (~2 blocks tall)
 
 type PartSpec = {
   size: [number, number, number];
@@ -300,9 +426,7 @@ const EYE_COLOR = 0x1a1410;
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 const ONE = new THREE.Vector3(1, 1, 1);
 
-function Villagers({ graph, count, connected }: { graph: VillageGraph; count: number; connected: boolean }) {
-  const system = useMemo(() => new VillagerSystem(graph), [graph]);
-  const hydrated = useRef(false);
+function Villagers({ system, fx }: { system: VillagerSystem; fx: VillageFx }) {
   const coloured = useRef(0);
   const meshRefs = useRef<(THREE.InstancedMesh | null)[]>([]);
 
@@ -323,25 +447,18 @@ function Villagers({ graph, count, connected }: { graph: VillageGraph; count: nu
     [parts]
   );
 
-  // Keep the village in step with the shared heartbeat count. The first sync
-  // after connecting seats existing guests directly on the outline (so a page
-  // refresh mid-event doesn't empty the border); every later increment walks
-  // a new villager out from the spawn point. A reset (count drops) clears all.
-  useEffect(() => {
-    if (!connected && !hydrated.current) return;
-    const instant = !hydrated.current;
-    hydrated.current = true;
-    if (count < system.total) system.reset();
-    while (system.total < count && system.spawn(instant)) {
-      // keep spawning until we've caught up or the ring is full
-    }
-  }, [count, connected, system]);
-
   useFrame((state, delta) => {
     const now = state.clock.getElapsedTime();
-    system.update(now, Math.min(delta, 0.1));
-    const villagers = system.villagers;
     const meshes = meshRefs.current;
+
+    // while the island is in pieces there's nothing to stand on
+    if (fx.morph > 0.02) {
+      for (const mesh of meshes) if (mesh) mesh.count = 0;
+      return;
+    }
+
+    system.update(now, Math.min(delta, 0.1), fx.uniforms.uColorRadius.value);
+    const villagers = system.villagers;
 
     // colours only change when villagers are added/removed
     if (villagers.length < coloured.current) coloured.current = 0;
@@ -526,26 +643,91 @@ function Lights() {
   }, []);
   return (
     <>
-      <hemisphereLight args={["#fff6d8", "#a86a3c", 0.5]} />
+      <hemisphereLight args={["#fffaf0", "#b9a48e", 0.55]} />
       <directionalLight ref={sunRef} position={[-40, 85, 55]} intensity={0.9} color="#fff3dc" castShadow />
       <directionalLight position={[60, 30, 10]} intensity={0.22} color="#ffe9c0" />
     </>
   );
 }
 
-function VillageScene({ village, count, connected }: { village: Village; count: number; connected: boolean }) {
+// ---------------------------------------------------------------------------
+// Scene: owns the effect state and the villager simulation, and keeps both in
+// step with the shared heartbeat count.
+// ---------------------------------------------------------------------------
+type SceneProps = {
+  village: Village;
+  count: number;
+  connected: boolean;
+  closing: boolean;
+  fullColorCount: number;
+};
+
+function VillageScene({ village, count, connected, closing, fullColorCount }: SceneProps) {
   const graph = useMemo(() => buildVillageGraph(village), [village]);
+  const fx = useMemo(() => new VillageFx(), []);
+  const system = useMemo(() => new VillagerSystem(graph, village), [graph, village]);
+  const hydrated = useRef(false);
+  const prevCount = useRef(0);
+
+  // The first sync after connecting seats the existing guests and paints the
+  // island to match, with no fanfare (a page refresh mid-event shouldn't
+  // replay the whole evening). Every later heartbeat walks a new villager
+  // in, pushes the paint front outward, and lifts the island into a heart.
+  useEffect(() => {
+    if (!connected && !hydrated.current) return;
+    const first = !hydrated.current;
+    hydrated.current = true;
+    const radius = colorRadiusFor(count, fullColorCount, graph);
+
+    if (first) {
+      fx.snapColor(radius);
+      system.reset();
+      while (system.total < count && system.spawn(true, radius)) {
+        // seat everyone already counted
+      }
+    } else if (count < prevCount.current) {
+      // operator reset: everyone leaves and the island fades back to white
+      system.reset();
+      fx.setColorTarget(radius);
+    } else if (count > prevCount.current) {
+      fx.setColorTarget(radius);
+      while (system.total < count && system.spawn(false, radius)) {
+        // one villager per heartbeat
+      }
+      fx.beat(count - prevCount.current);
+    }
+    prevCount.current = count;
+  }, [count, connected, fullColorCount, graph, fx, system]);
+
+  useEffect(() => {
+    fx.setForceHeart(closing);
+  }, [closing, fx]);
+
+  useFrame((state, delta) => {
+    fx.update(state.clock.getElapsedTime(), Math.min(delta, 0.1));
+  });
+
   return (
     <>
       <CameraRig village={village} />
       <Lights />
-      <Terrain village={village} graph={graph} />
-      <Villagers graph={graph} count={count} connected={connected} />
+      <Terrain village={village} graph={graph} fx={fx} />
+      <Villagers system={system} fx={fx} />
     </>
   );
 }
 
-export function VoxelVillage({ count, connected }: { count: number; connected: boolean }) {
+export function VoxelVillage({
+  count,
+  connected,
+  closing = false,
+  fullColorCount = DEFAULT_FULL_COLOR_COUNT,
+}: {
+  count: number;
+  connected: boolean;
+  closing?: boolean;
+  fullColorCount?: number;
+}) {
   const [village, setVillage] = useState<Village | null>(null);
 
   useEffect(() => {
@@ -567,7 +749,15 @@ export function VoxelVillage({ count, connected }: { count: number; connected: b
       className="!absolute inset-0"
     >
       <color attach="background" args={[BACKGROUND]} />
-      {village && <VillageScene village={village} count={count} connected={connected} />}
+      {village && (
+        <VillageScene
+          village={village}
+          count={count}
+          connected={connected}
+          closing={closing}
+          fullColorCount={fullColorCount}
+        />
+      )}
     </Canvas>
   );
 }
